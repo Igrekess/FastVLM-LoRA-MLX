@@ -773,9 +773,8 @@ def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_w
     # Add quantization info if model was quantized
     if quantize:
         metadone_config["quantization"] = {
-            "bits": 4,
             "group_size": 64,
-            "quant_method": "linear"
+            "bits": 4
         }
 
     config_file = os.path.join(output_dir, "config.json")
@@ -800,6 +799,49 @@ def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_w
                 copied_files += 1
 
     print(f"  Copied {copied_files} tokenizer/processor files")
+
+    # Generate tokenizer.json if not present (required by mlx-swift-transformers)
+    tokenizer_json_path = os.path.join(output_dir, "tokenizer.json")
+    if not os.path.exists(tokenizer_json_path):
+        print("  Generating tokenizer.json from vocab.json + merges.txt...")
+        try:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            tokenizer.save_pretrained(output_dir)
+            if os.path.exists(tokenizer_json_path):
+                print("  Generated tokenizer.json successfully")
+            else:
+                print("  WARNING: Could not generate tokenizer.json - model may not load in MetaDone")
+        except Exception as e:
+            print(f"  WARNING: Failed to generate tokenizer.json: {e}")
+
+    # Copy preprocessor/processor configs from bundled model if missing
+    # These files are required by mlx-swift but not present in HF base model
+    bundled_model_paths = [
+        os.path.join(script_dir, "..", "Models", "fastvlm-0.5b-captions"),
+        os.path.join(script_dir, "Models", "fastvlm-0.5b-captions"),
+    ]
+    for parent in ["Resources/Models/fastvlm-0.5b-captions", "../Resources/Models/fastvlm-0.5b-captions"]:
+        bundled_model_paths.append(os.path.join(script_dir, parent))
+
+    bundled_model_dir = None
+    for candidate in bundled_model_paths:
+        if os.path.exists(os.path.join(candidate, "preprocessor_config.json")):
+            bundled_model_dir = candidate
+            break
+
+    if bundled_model_dir:
+        # Copy tokenizer.json from bundled model - it contains the <image> token (id 151646)
+        # that is required for vision-language models but not included in AutoTokenizer.save_pretrained()
+        extra_files = ["preprocessor_config.json", "processor_config.json", "tokenizer.json"]
+        for ef in extra_files:
+            src = os.path.join(bundled_model_dir, ef)
+            dst = os.path.join(output_dir, ef)
+            if os.path.exists(src):
+                # For tokenizer.json, always overwrite to ensure <image> token is present
+                if ef == "tokenizer.json" or not os.path.exists(dst):
+                    shutil.copy2(src, dst)
+                    print(f"  Copied {ef} from bundled model")
 
     # Copy fastvithd.mlpackage from bundle (if running from app)
     # The script will look for it relative to its own location
