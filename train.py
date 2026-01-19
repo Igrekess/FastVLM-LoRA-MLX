@@ -491,7 +491,7 @@ def load_fastvlm_model(model_path: str):
     return model, tokenizer, image_processor
 
 
-def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_weights: dict, quantize: bool = False):
+def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_weights: dict, quantize: bool = False, hf_token: str = None):
     """
     Finalize the trained model for use in MetaDone.
 
@@ -510,9 +510,14 @@ def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_w
 
     print("[PROGRESS] Step 1/6: Loading base model weights...", flush=True)
 
+    # Use token from argument or environment variable
+    effective_token = hf_token or os.environ.get('HF_TOKEN')
+    if effective_token:
+        print("  Using Hugging Face authentication token")
+
     # Download base model if needed
     try:
-        model_path = snapshot_download(base_model_name)
+        model_path = snapshot_download(base_model_name, token=effective_token)
         print(f"  Base model path: {model_path}")
     except Exception as e:
         print(f"  Warning: Could not download base model: {e}")
@@ -836,6 +841,7 @@ def train(
     lora_alpha: int = 16,
     max_samples: int = None,
     quantize: bool = False,
+    hf_token: str = None,
 ):
     """Main training function."""
 
@@ -1135,7 +1141,7 @@ def train(
     print(f"\n{'='*60}")
     print("Finalizing model for MetaDone...")
     print(f"{'='*60}")
-    finalize_model_for_metadone(output_dir, model_name, adapter_weights, quantize=quantize)
+    finalize_model_for_metadone(output_dir, model_name, adapter_weights, quantize=quantize, hf_token=hf_token)
 
     print(f"\n{'='*60}")
     print("Training Complete!")
@@ -1215,6 +1221,13 @@ def main():
         help="Quantize the final model to 4-bit"
     )
 
+    parser.add_argument(
+        "--hf-token",
+        type=str,
+        default=None,
+        help="Hugging Face access token for authentication"
+    )
+
     args = parser.parse_args()
 
     train(
@@ -1228,6 +1241,7 @@ def main():
         lora_alpha=args.lora_alpha,
         max_samples=args.max_samples,
         quantize=args.quantize,
+        hf_token=args.hf_token,
     )
 
 
