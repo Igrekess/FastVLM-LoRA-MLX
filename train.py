@@ -713,6 +713,17 @@ def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_w
     size_mb = os.path.getsize(output_model_file) / (1024 * 1024)
     print(f"  Saved model: {size_mb:.1f} MB {'(4-bit)' if quantize else '(16-bit)'}")
 
+    # Create model.safetensors.index.json (required by mlx-swift)
+    total_size = sum(w.nbytes for w in final_weights.values())
+    index = {
+        "metadata": {"total_size": total_size},
+        "weight_map": {k: "model.safetensors" for k in final_weights.keys()}
+    }
+    index_path = os.path.join(output_dir, "model.safetensors.index.json")
+    with open(index_path, "w") as f:
+        json.dump(index, f, indent=4)
+    print(f"  Created model index")
+
     # Remove adapter files (no longer needed)
     adapter_file = os.path.join(output_dir, "adapter.safetensors")
     adapter_config = os.path.join(output_dir, "adapter_config.json")
