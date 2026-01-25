@@ -1,3 +1,5 @@
+(NOT WORKING FOR NOW)
+
 # FastVLM LoRA Fine-tuning with MLX
 
 Fine-tune Apple's [FastVLM](https://huggingface.co/apple/FastVLM-0.5B) vision-language model using LoRA adapters on Apple Silicon.
