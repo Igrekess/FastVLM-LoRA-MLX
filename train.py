@@ -323,13 +323,19 @@ class LoRALinear(nn.Module):
         self.lora_a = mx.random.normal((input_dims, rank)) * 0.01
         self.lora_b = mx.zeros((rank, output_dims))
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, training: bool = True) -> mx.array:
         # Original output (frozen weights)
         y = self.linear(x)
 
-        # LoRA adaptation
+        # LoRA adaptation with optional dropout
         # x @ A @ B * scale
-        lora_out = (x @ self.lora_a) @ self.lora_b * self.scale
+        lora_input = x
+        if self.dropout > 0 and training:
+            # Apply dropout mask
+            mask = mx.random.bernoulli(1 - self.dropout, x.shape)
+            lora_input = (x * mask) / (1 - self.dropout)
+
+        lora_out = (lora_input @ self.lora_a) @ self.lora_b * self.scale
 
         return y + lora_out
 
@@ -472,26 +478,26 @@ def load_dataset(dataset_path: str, max_samples: int = None) -> List[Dict]:
 # ============================================================
 
 def load_fastvlm_model(model_path: str):
-    """Load FastVLM model directly using mlx_vlm internals."""
-    from mlx_vlm.utils import load_model, load_image_processor, get_model_path
-    from transformers import AutoTokenizer
+    """Load FastVLM model using mlx_vlm.load for proper multimodal support."""
+    from mlx_vlm import load
 
-    # Get model path
-    model_path = Path(get_model_path(model_path))
+    # The Apple model doesn't have preprocessor_config.json, so we use mlx-community version
+    # which has all required processor files for proper multimodal handling
+    mlx_community_model = "mlx-community/FastVLM-0.5B-bf16"
 
-    # Load model
-    model = load_model(model_path, lazy=False, trust_remote_code=True)
+    # Use mlx_vlm.load which returns the full processor with proper image handling
+    # We load from mlx-community to get the proper processor with image handling
+    model, processor = load(mlx_community_model, trust_remote_code=True)
 
-    # Load tokenizer directly (without full processor)
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    # Extract tokenizer for compatibility with existing code
+    tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
 
-    # Load image processor if available
-    image_processor = load_image_processor(model_path, trust_remote_code=True)
+    # Return processor as image_processor for backward compatibility
+    # The processor contains both tokenizer and image_processor
+    return model, tokenizer, processor
 
-    return model, tokenizer, image_processor
 
-
-def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_weights: dict, quantize: bool = False, hf_token: str = None):
+def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_weights: dict, lora_rank: int = 8, lora_alpha: int = 16, quantize: bool = False, keep_adapter: bool = False, hf_token: str = None):
     """
     Finalize the trained model for use in MetaDone.
 
@@ -548,23 +554,39 @@ def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_w
     print("[PROGRESS] Step 2/5: Converting to MLX format...", flush=True)
 
     def convert_key(key):
-        """Convert PyTorch key to MLX-VLM format."""
-        # mm_projector.X -> multi_modal_projector.linear_X
-        if key.startswith("model.mm_projector."):
-            match = re.match(r"model\.mm_projector\.(\d+)\.(.*)", key)
-            if match:
-                idx, rest = match.groups()
-                return f"multi_modal_projector.linear_{idx}.{rest}"
+        """Convert PyTorch key to MLX-VLM format.
 
-        # vision_tower keys - remove from output (using CoreML instead)
+        mlx_vlm expects the final format directly:
+        - mm_projector keys: mm_projector.X
+        - vision_tower keys: vision_tower.vision_model.X
+        - language model keys: language_model.model.X
+        - lm_head keys: skip (tied with embed_tokens)
+        """
+        # mm_projector keys
+        if "mm_projector" in key:
+            if key.startswith("model."):
+                return key[6:]  # Remove "model." prefix -> mm_projector.X
+            return key
+
+        # vision_tower keys - convert to mlx_vlm format
         if "vision_tower" in key:
-            return None  # Skip vision tower keys
+            if key.startswith("model.vision_tower.vision_tower.model."):
+                new_key = "vision_tower.vision_model." + key[38:]
+                new_key = new_key.replace("patch_embed.", "patch_embed.blocks.")
+                return new_key
+            elif key.startswith("model.vision_tower."):
+                return key[6:]  # Remove "model." prefix
+            return key
 
-        # Language model keys
-        if key.startswith("model."):
-            return "language_model." + key
-
+        # lm_head keys - skip because mlx_vlm ties lm_head weights with embed_tokens
         if key.startswith("lm_head."):
+            return None
+
+        # Language model keys - convert to mlx_vlm format directly
+        # model.layers.X -> language_model.model.layers.X
+        # model.embed_tokens.X -> language_model.model.embed_tokens.X
+        # model.norm.X -> language_model.model.norm.X
+        if key.startswith("model."):
             return "language_model." + key
 
         return key
@@ -578,16 +600,21 @@ def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_w
         else:
             skipped += 1
 
-    print(f"  Converted {len(converted_weights)} tensors (skipped {skipped} vision_tower tensors)")
+    print(f"  Converted {len(converted_weights)} tensors")
 
     print("[PROGRESS] Step 3/5: Merging LoRA adapter...", flush=True)
 
     def get_base_key_from_lora(lora_key):
-        """Convert LoRA key to base model key."""
+        """Convert LoRA key to base model key.
+
+        LoRA keys are like: layers[0].self_attn.q_proj.lora_a
+        Base keys should be: language_model.model.layers.0.self_attn.q_proj.weight
+        (matching the converted mlx_vlm format)
+        """
         match = re.match(r"(.+)\.(lora_[ab])", lora_key)
         if match:
             path, lora_type = match.groups()
-            # layers[0].mlp.down_proj -> language_model.model.layers.0.mlp.down_proj.weight
+            # layers[0].mlp.down_proj -> layers.0.mlp.down_proj
             path = re.sub(r"layers\[(\d+)\]", r"layers.\1", path)
             base_key = f"language_model.model.{path}.weight"
             return base_key, lora_type
@@ -608,7 +635,8 @@ def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_w
 
     # Merge LoRA: W' = W + (lora_b.T @ lora_a.T) * scale
     merged_count = 0
-    scale = 1.0
+    scale = lora_alpha / lora_rank
+    print(f"  Using LoRA scale: {scale} (alpha={lora_alpha}, rank={lora_rank})")
     for base_key, lora in lora_pairs.items():
         if 'lora_a' in lora and 'lora_b' in lora and base_key in converted_weights:
             lora_a = lora['lora_a']
@@ -724,74 +752,81 @@ def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_w
         json.dump(index, f, indent=4)
     print(f"  Created model index")
 
-    # Remove adapter files (no longer needed)
-    adapter_file = os.path.join(output_dir, "adapter.safetensors")
-    adapter_config = os.path.join(output_dir, "adapter_config.json")
-    if os.path.exists(adapter_file):
-        os.remove(adapter_file)
-    if os.path.exists(adapter_config):
-        os.remove(adapter_config)
+    # Remove adapter files (unless --keep-adapter was specified)
+    if not keep_adapter:
+        adapter_file = os.path.join(output_dir, "adapter.safetensors")
+        adapter_config = os.path.join(output_dir, "adapter_config.json")
+        if os.path.exists(adapter_file):
+            os.remove(adapter_file)
+        if os.path.exists(adapter_config):
+            os.remove(adapter_config)
+    else:
+        print(f"  Keeping adapter files (adapter.safetensors, adapter_config.json)")
 
     config_step = save_step + 1
     print(f"[PROGRESS] Step {config_step}/{total_steps}: Creating config and copying assets...", flush=True)
 
-    # Create config.json for MetaDone
-    metadone_config = {
-        "architectures": ["LlavaQwen2ForCausalLM"],
-        "attention_dropout": 0.0,
-        "bos_token_id": 151643,
-        "eos_token_id": 151645,
-        "freeze_mm_mlp_adapter": False,
-        "hidden_act": "silu",
-        "hidden_size": 896,
-        "image_aspect_ratio": "pad",
-        "image_grid_pinpoints": None,
-        "image_token_index": 151646,
-        "initializer_range": 0.02,
-        "intermediate_size": 4864,
-        "max_position_embeddings": 32768,
-        "max_window_layers": 24,
-        "mm_hidden_size": 3072,
-        "mm_patch_merge_type": "flat",
-        "mm_projector_lr": None,
-        "mm_projector_type": "mlp2x_gelu",
-        "mm_use_im_patch_token": False,
-        "mm_use_im_start_end": False,
-        "mm_vision_select_feature": "patch",
-        "mm_vision_select_layer": -2,
-        "mm_vision_tower": "mobileclip_l_1024",
-        "model_type": "llava_qwen2",
-        "num_attention_heads": 14,
-        "num_hidden_layers": 24,
-        "num_key_value_heads": 2,
-        "rms_norm_eps": 1e-06,
-        "rope_theta": 1000000.0,
-        "sliding_window": 32768,
-        "tie_word_embeddings": False,
-        "tokenizer_model_max_length": 8192,
-        "tokenizer_padding_side": "right",
-        "torch_dtype": "bfloat16",
-        "transformers_version": "4.39.3",
-        "tune_mm_mlp_adapter": False,
-        "unfreeze_mm_vision_tower": True,
-        "use_cache": True,
-        "use_mm_proj": True,
-        "use_sliding_window": False,
-        "vision_config": {},
-        "vocab_size": 151936
-    }
-
-    # Add quantization info if model was quantized
-    if quantize:
-        metadone_config["quantization"] = {
-            "group_size": 64,
-            "bits": 4
-        }
-
+    # Copy config.json from mlx-community model (has all required fields including vision_config)
     config_file = os.path.join(output_dir, "config.json")
-    with open(config_file, "w") as f:
-        json.dump(metadone_config, f, indent=4)
-    print(f"  Created config.json {'(with 4-bit quantization)' if quantize else '(16-bit)'}")
+    mlx_community_config = None
+
+    # Find mlx-community config.json
+    hf_cache = os.path.expanduser("~/.cache/huggingface/hub")
+    mlx_community_patterns = [
+        os.path.join(hf_cache, "models--mlx-community--FastVLM-0.5B-bf16", "snapshots", "*", "config.json"),
+    ]
+    import glob as glob_module
+    for pattern in mlx_community_patterns:
+        matches = glob_module.glob(pattern)
+        if matches:
+            mlx_community_config = matches[0]
+            break
+
+    if mlx_community_config and os.path.exists(mlx_community_config):
+        # Copy and optionally modify the config
+        with open(mlx_community_config, 'r') as f:
+            config_data = json.load(f)
+
+        # Add quantization info if model was quantized
+        if quantize:
+            config_data["quantization"] = {
+                "group_size": 64,
+                "bits": 4
+            }
+
+        with open(config_file, "w") as f:
+            json.dump(config_data, f, indent=4)
+        print(f"  Copied config.json from mlx-community {'(with 4-bit quantization)' if quantize else '(16-bit)'}")
+    else:
+        # Fallback to minimal config if mlx-community not found
+        print("  WARNING: mlx-community config not found, creating minimal config")
+        metadone_config = {
+            "architectures": ["LlavaQwen2ForCausalLM"],
+            "attention_dropout": 0.0,
+            "bos_token_id": 151643,
+            "eos_token_id": 151645,
+            "hidden_act": "silu",
+            "hidden_size": 896,
+            "image_token_index": 151646,
+            "intermediate_size": 4864,
+            "max_position_embeddings": 32768,
+            "mm_hidden_size": 3072,
+            "mm_projector_type": "mlp2x_gelu",
+            "mm_vision_tower": "mobileclip_l_1024",
+            "model_type": "llava_qwen2",
+            "num_attention_heads": 14,
+            "num_hidden_layers": 24,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-06,
+            "rope_theta": 1000000.0,
+            "tie_word_embeddings": True,
+            "use_cache": True,
+            "vocab_size": 151936
+        }
+        if quantize:
+            metadone_config["quantization"] = {"group_size": 64, "bits": 4}
+        with open(config_file, "w") as f:
+            json.dump(metadone_config, f, indent=4)
 
     # Copy tokenizer files from base model
     tokenizer_files = [
@@ -826,14 +861,34 @@ def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_w
         except Exception as e:
             print(f"  WARNING: Failed to generate tokenizer.json: {e}")
 
-    # Copy preprocessor/processor configs from bundled model if missing
-    # These files are required by mlx-swift but not present in HF base model
+    # Re-copy tokenizer_config.json from base model to preserve chat_template
+    # (AutoTokenizer.save_pretrained may overwrite it without chat_template)
+    if model_path:
+        src_tokenizer_config = os.path.join(model_path, "tokenizer_config.json")
+        dst_tokenizer_config = os.path.join(output_dir, "tokenizer_config.json")
+        if os.path.exists(src_tokenizer_config):
+            shutil.copy2(src_tokenizer_config, dst_tokenizer_config)
+            print("  Restored tokenizer_config.json with chat_template from base model")
+
+    # Copy preprocessor/processor configs from bundled model or mlx-community cache
+    # These files are required by mlx_vlm but not present in HF base model
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     bundled_model_paths = [
         os.path.join(script_dir, "..", "Models", "fastvlm-0.5b-captions"),
         os.path.join(script_dir, "Models", "fastvlm-0.5b-captions"),
     ]
     for parent in ["Resources/Models/fastvlm-0.5b-captions", "../Resources/Models/fastvlm-0.5b-captions"]:
         bundled_model_paths.append(os.path.join(script_dir, parent))
+
+    # Also check mlx-community model cache for processor files
+    hf_cache = os.path.expanduser("~/.cache/huggingface/hub")
+    mlx_community_patterns = [
+        os.path.join(hf_cache, "models--mlx-community--FastVLM-0.5B-bf16", "snapshots", "*"),
+    ]
+    import glob
+    for pattern in mlx_community_patterns:
+        matches = glob.glob(pattern)
+        bundled_model_paths.extend(matches)
 
     bundled_model_dir = None
     for candidate in bundled_model_paths:
@@ -842,21 +897,22 @@ def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_w
             break
 
     if bundled_model_dir:
-        # Copy tokenizer.json from bundled model - it contains the <image> token (id 151646)
-        # that is required for vision-language models but not included in AutoTokenizer.save_pretrained()
-        extra_files = ["preprocessor_config.json", "processor_config.json", "tokenizer.json"]
+        # Copy processor files required for mlx_vlm inference
+        extra_files = [
+            "preprocessor_config.json", "processor_config.json",
+            "tokenizer.json", "tokenizer_config.json",
+            "processing_fastvlm.py", "llava_qwen.py"
+        ]
         for ef in extra_files:
             src = os.path.join(bundled_model_dir, ef)
             dst = os.path.join(output_dir, ef)
             if os.path.exists(src):
-                # For tokenizer.json, always overwrite to ensure <image> token is present
-                if ef == "tokenizer.json" or not os.path.exists(dst):
-                    shutil.copy2(src, dst)
-                    print(f"  Copied {ef} from bundled model")
+                # Always overwrite to ensure correct processor files
+                shutil.copy2(src, dst)
+                print(f"  Copied {ef} from {os.path.basename(bundled_model_dir)}")
 
     # Copy fastvithd.mlpackage from bundle (if running from app)
     # The script will look for it relative to its own location
-    script_dir = os.path.dirname(os.path.abspath(__file__))
     mlpackage_src = os.path.join(script_dir, "..", "Models", "fastvlm-0.5b-captions", "fastvithd.mlpackage")
 
     # Also try bundle Resources path
@@ -894,7 +950,10 @@ def train(
     lora_alpha: int = 16,
     max_samples: int = None,
     quantize: bool = False,
+    keep_adapter: bool = False,
     hf_token: str = None,
+    dropout: float = 0.0,
+    warmup_ratio: float = 0.0,
 ):
     """Main training function."""
 
@@ -905,6 +964,10 @@ def train(
     print(f"Dataset: {dataset_path}")
     print(f"Output: {output_dir}")
     print(f"LoRA rank: {lora_rank}, alpha: {lora_alpha}")
+    if dropout > 0:
+        print(f"LoRA dropout: {dropout}")
+    if warmup_ratio > 0:
+        print(f"Warmup ratio: {warmup_ratio} (cosine scheduler)")
     print(f"Quantize: {'Yes (4-bit)' if quantize else 'No (16-bit)'}")
     print(f"{'='*60}\n")
 
@@ -944,7 +1007,7 @@ def train(
             if hasattr(layer.self_attn, proj_name):
                 orig_linear = getattr(layer.self_attn, proj_name)
                 if isinstance(orig_linear, nn.Linear):
-                    lora_layer = LoRALinear.from_linear(orig_linear, rank=lora_rank, alpha=lora_alpha)
+                    lora_layer = LoRALinear.from_linear(orig_linear, rank=lora_rank, alpha=lora_alpha, dropout=dropout)
                     setattr(layer.self_attn, proj_name, lora_layer)
                     path = f"layers[{i}].self_attn.{proj_name}"
                     lora_layers[path] = lora_layer
@@ -955,7 +1018,7 @@ def train(
             if hasattr(layer.mlp, proj_name):
                 orig_linear = getattr(layer.mlp, proj_name)
                 if isinstance(orig_linear, nn.Linear):
-                    lora_layer = LoRALinear.from_linear(orig_linear, rank=lora_rank, alpha=lora_alpha)
+                    lora_layer = LoRALinear.from_linear(orig_linear, rank=lora_rank, alpha=lora_alpha, dropout=dropout)
                     setattr(layer.mlp, proj_name, lora_layer)
                     path = f"layers[{i}].mlp.{proj_name}"
                     lora_layers[path] = lora_layer
@@ -990,8 +1053,29 @@ def train(
     # plain mx.array attributes.
     print("\nLoRA training mode: only lora_a and lora_b will be updated")
 
+    # ================================================================
+    # Setup learning rate scheduler (cosine with warmup)
+    # ================================================================
+    total_steps = epochs * math.ceil(len(dataset) / batch_size)
+    warmup_steps = int(total_steps * warmup_ratio)
+
+    def get_lr(step: int) -> float:
+        """Get learning rate for given step with warmup + cosine decay."""
+        if warmup_ratio <= 0:
+            return learning_rate
+
+        if step < warmup_steps:
+            # Linear warmup
+            return learning_rate * (step + 1) / warmup_steps
+        else:
+            # Cosine decay
+            progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+            return learning_rate * 0.5 * (1 + math.cos(math.pi * progress))
+
     # Setup optimizer for LoRA parameters only
     print("Setting up optimizer...")
+    if warmup_ratio > 0:
+        print(f"  Using cosine scheduler: {warmup_steps} warmup steps, {total_steps} total steps")
     optimizer = optim.Adam(learning_rate=learning_rate)
 
     # ================================================================
@@ -1022,10 +1106,19 @@ def train(
     # ================================================================
     # Define loss function for nn.value_and_grad()
     # ================================================================
+    # Get image token index from model config
+    image_token_index = getattr(model.config, 'image_token_index', -200)
+    # FastVLM expands each image token to this many visual embeddings
+    num_image_tokens = 256  # FastVLM uses 256 visual tokens per image
+
     def loss_fn(model, input_ids, pixel_values, mask):
         """
         Compute cross-entropy loss for a single sample.
-        This function is designed to be differentiable by MLX.
+        This function handles image token expansion - the model expands each
+        image token (-200) into multiple visual embeddings (256 tokens).
+
+        Strategy: Build expanded labels that match logits shape by inserting
+        ignore tokens (-100) at visual embedding positions.
         """
         # Forward pass
         output = model(
@@ -1037,12 +1130,82 @@ def train(
         # Extract logits
         logits = output.logits if hasattr(output, 'logits') else output
 
-        # Compute language modeling loss (predict next token)
-        # Shift logits and labels for next-token prediction
-        shift_logits = logits[:, :-1, :].reshape(-1, logits.shape[-1])
-        shift_labels = input_ids[0, 1:].reshape(-1)  # input_ids is (1, seq_len)
+        # Handle image token expansion
+        # Input: (1, input_len) with image_token_index at some position
+        # Output: (1, output_len, vocab_size) where output_len = input_len - 1 + num_image_tokens
+        input_len = input_ids.shape[1]
+        output_len = logits.shape[1]
 
-        loss = nn.losses.cross_entropy(shift_logits, shift_labels, reduction="mean")
+        # Find position of image token in input_ids
+        input_ids_flat = input_ids[0]  # Shape: (input_len,)
+
+        # Build expanded labels using concatenation (MLX-friendly)
+        # Structure: [tokens_before_image, ignore_tokens_for_image, tokens_after_image]
+
+        image_pos = None
+        for i in range(input_len):
+            if input_ids_flat[i].item() == image_token_index:
+                image_pos = i
+                break
+
+        if image_pos is not None:
+            # Tokens before image (for next-token prediction, shift by 1)
+            before_image = input_ids_flat[1:image_pos+1] if image_pos > 0 else mx.array([], dtype=mx.int32)
+
+            # Ignore tokens for visual embeddings (-100)
+            ignore_visual = mx.full((num_image_tokens,), -100, dtype=mx.int32)
+
+            # Tokens after image
+            after_image = input_ids_flat[image_pos+2:] if image_pos + 1 < input_len else mx.array([], dtype=mx.int32)
+
+            # Concatenate to form labels
+            parts = []
+            if before_image.size > 0:
+                parts.append(before_image)
+            parts.append(ignore_visual)
+            if after_image.size > 0:
+                parts.append(after_image)
+
+            if len(parts) > 1:
+                labels = mx.concatenate(parts)
+            else:
+                labels = parts[0]
+
+            # Pad or trim to match output_len - 1 (for shifted prediction)
+            target_len = output_len - 1
+            if labels.size < target_len:
+                padding = mx.full((target_len - labels.size,), -100, dtype=mx.int32)
+                labels = mx.concatenate([labels, padding])
+            elif labels.size > target_len:
+                labels = labels[:target_len]
+        else:
+            # No image token, standard next-token prediction
+            labels = input_ids_flat[1:]
+            target_len = output_len - 1
+            if labels.size < target_len:
+                padding = mx.full((target_len - labels.size,), -100, dtype=mx.int32)
+                labels = mx.concatenate([labels, padding])
+
+        # Shift logits for next-token prediction
+        shift_logits = logits[0, :-1, :]  # (output_len-1, vocab_size)
+
+        # Create mask for valid (non-ignored) positions
+        valid_mask = (labels >= 0).astype(mx.float32)
+        num_valid = mx.sum(valid_mask)
+
+        # Replace -100 with 0 for safe indexing
+        safe_labels = mx.maximum(labels, 0)
+
+        # Compute log softmax for numerical stability
+        log_probs = shift_logits - mx.logsumexp(shift_logits, axis=-1, keepdims=True)
+
+        # Gather log probs for target tokens
+        gathered = mx.take_along_axis(log_probs, safe_labels[:, None], axis=1)[:, 0]
+
+        # Apply mask and compute mean loss (only on valid tokens)
+        masked_loss = -gathered * valid_mask
+        loss = mx.sum(masked_loss) / mx.maximum(num_valid, mx.array(1.0))
+
         return loss
 
     # Create the value_and_grad function
@@ -1054,6 +1217,7 @@ def train(
     # ================================================================
     print(f"\nTraining for {epochs} epochs...")
     steps_per_epoch = math.ceil(len(dataset) / batch_size)
+    global_step = 0
 
     for epoch in range(epochs):
         print(f"\n--- Epoch {epoch + 1}/{epochs} ---")
@@ -1072,40 +1236,28 @@ def train(
 
             for item in batch:
                 try:
-                    # Load image
-                    image = Image.open(item["image"]).convert("RGB")
+                    # Get image path and caption
+                    image_path = item["image"]
                     caption = item["caption"]
 
-                    # Create prompt (FastVLM/Qwen2 format)
+                    # Create prompt with image token (FastVLM/Qwen2 format)
+                    # The <image> token will be replaced by image_token_index (-200) by prepare_inputs
                     prompt = f"<|im_start|>user\n<image>\nDescribe this image.<|im_end|>\n<|im_start|>assistant\n{caption}<|im_end|>"
 
-                    # Tokenize text
-                    text_inputs = tokenizer(
-                        prompt,
-                        return_tensors="np",
-                        padding=True,
-                        truncation=True,
-                        max_length=2048,
+                    # Use mlx_vlm's prepare_inputs to properly handle image + text fusion
+                    # This correctly inserts the image token at the right position
+                    from mlx_vlm.generate import prepare_inputs
+
+                    inputs = prepare_inputs(
+                        image_processor,  # This is actually the full processor now
+                        images=[image_path],
+                        prompts=prompt,
+                        image_token_index=model.config.image_token_index,
                     )
-                    input_ids = mx.array(text_inputs["input_ids"])  # Shape: (1, seq_len)
 
-                    # Process image - FastVLM expects (B, C, H, W)
-                    if image_processor is not None:
-                        pixel_values = image_processor.preprocess([image])
-                        if isinstance(pixel_values, dict):
-                            pixel_values = pixel_values.get("pixel_values", pixel_values)
-                        if not isinstance(pixel_values, mx.array):
-                            pixel_values = mx.array(pixel_values)
-                    else:
-                        # Fallback: simple image processing for FastVLM
-                        img_np = np.array(image.resize((384, 384))).astype(np.float32) / 255.0
-                        mean = np.array([0.485, 0.456, 0.406])
-                        std = np.array([0.229, 0.224, 0.225])
-                        img_np = (img_np - mean) / std
-                        pixel_values = mx.array(img_np.transpose(2, 0, 1)[None, :].astype(np.float32))
-
-                    # Create attention mask
-                    mask = mx.ones_like(input_ids)
+                    input_ids = inputs["input_ids"]  # Shape: (1, seq_len) with image token inserted
+                    pixel_values = inputs["pixel_values"]  # Shape: (1, C, H, W)
+                    mask = inputs.get("attention_mask", mx.ones_like(input_ids))
 
                     # ============================================
                     # COMPUTE LOSS AND GRADIENTS
@@ -1135,24 +1287,48 @@ def train(
                 batch_grads = tree_map(lambda g: g / valid_samples, batch_grads)
                 batch_loss = batch_loss / valid_samples
 
-                # ============================================
-                # ZERO OUT NON-LoRA GRADIENTS
-                # ============================================
-                lora_grads = zero_non_lora_grads(batch_grads)
-
-                # ============================================
-                # UPDATE PARAMETERS WITH OPTIMIZER
-                # ============================================
-                optimizer.update(model, lora_grads)
-
-                # Force computation (MLX uses lazy evaluation)
-                # mx.eval forces immediate computation of lazy arrays
-                state = [model.parameters(), optimizer.state, batch_loss]
-                mx.eval(state)
-
+                # Force MLX computation to check for NaN
+                mx_eval = mx.eval  # MLX's eval for lazy computation, not Python's eval
+                mx_eval(batch_loss)
                 loss_value = batch_loss.item()
-                total_loss += loss_value
-                num_samples += 1
+
+                # Skip update if loss is NaN or Inf
+                if not (math.isnan(loss_value) or math.isinf(loss_value)):
+                    # ============================================
+                    # ZERO OUT NON-LoRA GRADIENTS
+                    # ============================================
+                    lora_grads = zero_non_lora_grads(batch_grads)
+
+                    # ============================================
+                    # GRADIENT CLIPPING for stability
+                    # ============================================
+                    def clip_grad(g):
+                        if isinstance(g, mx.array):
+                            return mx.clip(g, -1.0, 1.0)
+                        return g
+                    lora_grads = tree_map(clip_grad, lora_grads)
+
+                    # ============================================
+                    # UPDATE LEARNING RATE (scheduler)
+                    # ============================================
+                    if warmup_ratio > 0:
+                        current_lr = get_lr(global_step)
+                        optimizer.learning_rate = current_lr
+
+                    # ============================================
+                    # UPDATE PARAMETERS WITH OPTIMIZER
+                    # ============================================
+                    optimizer.update(model, lora_grads)
+                    global_step += 1
+
+                    # Force MLX computation
+                    state = [model.parameters(), optimizer.state]
+                    mx_eval(state)
+
+                    total_loss += loss_value
+                    num_samples += 1
+                else:
+                    print(f"  Warning: Skipping step due to NaN/Inf loss")
 
                 if step % 10 == 0:
                     # Format expected by Swift: "Epoch X/Y, Step X/Y, Loss: X.XX"
@@ -1194,7 +1370,7 @@ def train(
     print(f"\n{'='*60}")
     print("Finalizing model for MetaDone...")
     print(f"{'='*60}")
-    finalize_model_for_metadone(output_dir, model_name, adapter_weights, quantize=quantize, hf_token=hf_token)
+    finalize_model_for_metadone(output_dir, model_name, adapter_weights, lora_rank=lora_rank, lora_alpha=lora_alpha, quantize=quantize, keep_adapter=keep_adapter, hf_token=hf_token)
 
     print(f"\n{'='*60}")
     print("Training Complete!")
@@ -1275,10 +1451,31 @@ def main():
     )
 
     parser.add_argument(
+        "--keep-adapter",
+        action="store_true",
+        default=False,
+        help="Keep adapter.safetensors and adapter_config.json after merging (for re-merging later)"
+    )
+
+    parser.add_argument(
         "--hf-token",
         type=str,
         default=None,
         help="Hugging Face access token for authentication"
+    )
+
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.0,
+        help="LoRA dropout rate (0.0-1.0, default: 0.0)"
+    )
+
+    parser.add_argument(
+        "--warmup-ratio",
+        type=float,
+        default=0.0,
+        help="Warmup ratio for cosine scheduler (0.0-1.0, default: 0.0 = no warmup)"
     )
 
     args = parser.parse_args()
@@ -1294,7 +1491,10 @@ def main():
         lora_alpha=args.lora_alpha,
         max_samples=args.max_samples,
         quantize=args.quantize,
+        keep_adapter=args.keep_adapter,
         hf_token=args.hf_token,
+        dropout=args.dropout,
+        warmup_ratio=args.warmup_ratio,
     )
 
 
