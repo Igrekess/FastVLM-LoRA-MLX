@@ -7,7 +7,14 @@ Usage:
 """
 
 import argparse
+import os
 from pathlib import Path
+
+# Apply mlx_vlm patches before importing mlx_vlm
+from train import apply_mlx_vlm_patches
+if not os.environ.get('MLX_VLM_PATCHED'):
+    apply_mlx_vlm_patches()
+    os.environ['MLX_VLM_PATCHED'] = '1'
 
 
 def main():
@@ -35,13 +42,19 @@ def main():
 
     from mlx_vlm import load, generate
     from mlx_vlm.utils import load_image
+    from mlx_vlm.prompt_utils import apply_chat_template
 
     # Load model
-    model, processor = load(str(model_path))
+    model, processor = load(str(model_path), trust_remote_code=True)
 
     # Load image
     print(f"Loading image: {image_path}")
     image = load_image(str(image_path))
+
+    # Format prompt with chat template
+    formatted_prompt = apply_chat_template(
+        processor, model.config, args.prompt, num_images=1
+    )
 
     # Generate
     print(f"\nPrompt: {args.prompt}")
@@ -50,14 +63,14 @@ def main():
     output = generate(
         model,
         processor,
+        formatted_prompt,
         image,
-        args.prompt,
         max_tokens=args.max_tokens,
         temp=args.temperature,
         verbose=False,
     )
 
-    print(output)
+    print(output.text if hasattr(output, 'text') else output)
 
 
 if __name__ == "__main__":
