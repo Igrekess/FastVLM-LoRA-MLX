@@ -1,5 +1,3 @@
-(NOT WORKING FOR NOW)
-
 # FastVLM LoRA Fine-tuning with MLX
 
 Fine-tune Apple's [FastVLM](https://huggingface.co/apple/FastVLM-0.5B) vision-language model using LoRA adapters on Apple Silicon.
@@ -7,11 +5,11 @@ Fine-tune Apple's [FastVLM](https://huggingface.co/apple/FastVLM-0.5B) vision-la
 ## Features
 
 - Native MLX implementation for Apple Silicon (M1/M2/M3/M4)
-- LoRA (Low-Rank Adaptation) for efficient fine-tuning
+- LoRA (Low-Rank Adaptation) for memory-efficient fine-tuning
 - Automatic mlx_vlm compatibility patches
 - Support for CSV and JSONL dataset formats
 - Optional 4-bit quantization for smaller model size
-- Merged model output ready for inference
+- **Dual output formats**: Python (mlx-vlm) or iOS/macOS apps (mlx-swift)
 
 ## Requirements
 
@@ -23,7 +21,7 @@ Fine-tune Apple's [FastVLM](https://huggingface.co/apple/FastVLM-0.5B) vision-la
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/FastVLM-LoRA-MLX.git
+git clone https://github.com/AdrienMusic/FastVLM-LoRA-MLX.git
 cd FastVLM-LoRA-MLX
 
 # Create virtual environment
@@ -70,12 +68,23 @@ Or with conversations format:
 
 ## Usage
 
-### Basic Training
+### Basic Training (Python/mlx-vlm)
 
 ```bash
 python train.py \
     --dataset /path/to/your/dataset \
     --output ./output \
+    --epochs 3
+```
+
+### Training for iOS/macOS Apps (mlx-swift)
+
+```bash
+python train.py \
+    --dataset /path/to/your/dataset \
+    --output ./output \
+    --target mlx-swift \
+    --quantize \
     --epochs 3
 ```
 
@@ -92,6 +101,7 @@ python train.py \
     --lora-rank 64 \
     --lora-alpha 128 \
     --max-samples 1000 \
+    --target mlx-vlm \
     --quantize
 ```
 
@@ -108,7 +118,16 @@ python train.py \
 | `--lora-rank`, `-r` | `8` | LoRA rank (higher = more parameters) |
 | `--lora-alpha`, `-a` | `16` | LoRA alpha scaling factor |
 | `--max-samples` | None | Limit number of training samples |
+| `--target` | `mlx-vlm` | Output format: `mlx-vlm` (Python) or `mlx-swift` (iOS/macOS) |
 | `--quantize` | False | Quantize output to 4-bit |
+| `--keep-adapter` | False | Keep adapter files after merging |
+
+### Output Targets
+
+| Target | Use Case | Model Size |
+|--------|----------|------------|
+| `mlx-vlm` | Python inference with mlx_vlm library | ~1.2 GB (16-bit) / ~340 MB (4-bit) |
+| `mlx-swift` | iOS/macOS apps using mlx-swift | ~1.2 GB (16-bit) / ~340 MB (4-bit) |
 
 ### LoRA Rank Guidelines
 
@@ -119,36 +138,50 @@ python train.py \
 | 64 | ~35M | Better quality, larger datasets |
 | 128 | ~70M | Maximum quality |
 
-## Output
+## Inference
 
-After training, the output directory contains:
+### With inference.py
 
-```
-output/
-├── model.safetensors    # Merged model weights
-├── config.json          # Model configuration
-├── tokenizer.json       # Tokenizer
-├── tokenizer_config.json
-└── ...
+```bash
+python inference.py \
+    --model ./output \
+    --image test.jpg \
+    --prompt "Describe this image in detail."
 ```
 
-The model is ready to use with `mlx-vlm`:
+### With mlx-vlm directly
 
 ```python
 from mlx_vlm import load, generate
 from mlx_vlm.utils import load_image
 
-model, processor = load("./output")
+model, processor = load("./output", trust_remote_code=True)
 image = load_image("test_image.jpg")
 
 output = generate(
     model,
     processor,
+    "<|im_start|>user\n<image>\nDescribe this image.<|im_end|>\n<|im_start|>assistant\n",
     image,
-    "Describe this image in detail.",
     max_tokens=256
 )
 print(output)
+```
+
+## Output Structure
+
+```
+output/
+├── model.safetensors          # Merged model weights
+├── model.safetensors.index.json
+├── config.json                # Model configuration
+├── tokenizer.json             # Tokenizer
+├── tokenizer_config.json
+├── preprocessor_config.json
+├── processor_config.json
+├── special_tokens_map.json
+├── fastvithd.mlpackage/       # Vision encoder (mlx-swift only)
+└── ...
 ```
 
 ## Training Tips
@@ -157,6 +190,7 @@ print(output)
 2. **Monitor loss**: Loss should decrease between epochs. If not, try a lower learning rate
 3. **Memory**: If you run out of memory, reduce `--lora-rank` or ensure batch-size is 1
 4. **Quality captions**: The quality of your captions directly impacts the fine-tuned model
+5. **Quantization**: Use `--quantize` for deployment to reduce model size by ~70%
 
 ## Troubleshooting
 
