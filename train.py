@@ -554,33 +554,32 @@ def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_w
     print("[PROGRESS] Step 2/5: Converting to MLX format...", flush=True)
 
     def convert_key(key):
-        """Convert PyTorch key to MLX-VLM format.
+        """Convert PyTorch key to MLX-Swift format.
 
-        mlx_vlm expects the final format directly:
-        - mm_projector keys: mm_projector.X
-        - vision_tower keys: vision_tower.vision_model.X
+        mlx-swift FastVLM expects:
+        - mm_projector keys: multi_modal_projector.linear_X.weight/bias
+        - vision_tower keys: skip (using CoreML fastvithd.mlpackage)
         - language model keys: language_model.model.X
-        - lm_head keys: skip (tied with embed_tokens)
+        - lm_head keys: language_model.lm_head.X
         """
-        # mm_projector keys
+        # mm_projector keys -> multi_modal_projector.linear_X format for mlx-swift
         if "mm_projector" in key:
-            if key.startswith("model."):
-                return key[6:]  # Remove "model." prefix -> mm_projector.X
+            # model.mm_projector.0.weight -> multi_modal_projector.linear_0.weight
+            import re
+            match = re.match(r"(?:model\.)?mm_projector\.(\d+)\.(.*)", key)
+            if match:
+                idx, rest = match.groups()
+                return f"multi_modal_projector.linear_{idx}.{rest}"
             return key
 
-        # vision_tower keys - convert to mlx_vlm format
+        # vision_tower keys - SKIP entirely for mlx-swift
+        # mlx-swift uses CoreML fastvithd.mlpackage for vision encoder, not MLX weights
         if "vision_tower" in key:
-            if key.startswith("model.vision_tower.vision_tower.model."):
-                new_key = "vision_tower.vision_model." + key[38:]
-                new_key = new_key.replace("patch_embed.", "patch_embed.blocks.")
-                return new_key
-            elif key.startswith("model.vision_tower."):
-                return key[6:]  # Remove "model." prefix
-            return key
+            return None  # Skip vision_tower keys
 
-        # lm_head keys - skip because mlx_vlm ties lm_head weights with embed_tokens
+        # lm_head keys - convert to language_model.lm_head.X for mlx-swift
         if key.startswith("lm_head."):
-            return None
+            return "language_model." + key
 
         # Language model keys - convert to mlx_vlm format directly
         # model.layers.X -> language_model.model.layers.X
@@ -657,75 +656,47 @@ def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_w
     if quantize:
         print(f"[PROGRESS] Step 4/{total_steps}: Quantizing model to 4-bit...", flush=True)
 
-        # Quantize the merged model to 4-bit
+        # Use mx.quantize() for proper mlx-swift compatibility
+        # This produces uint32 packed format that mlx-swift expects
         group_size = 64
         bits = 4
 
-        def quantize_tensor(tensor, bits=4, group_size=64):
-            """Quantize a tensor to N-bit with group-wise quantization."""
+        def should_quantize(key, tensor):
+            """Determine if a tensor should be quantized."""
+            if not key.endswith('.weight'):
+                return False
+            if 'norm' in key.lower() or 'layernorm' in key.lower():
+                return False
+            # Note: embed_tokens IS quantized in the bundled model, so we quantize it too
             if tensor.ndim < 2:
-                return None  # Skip 1D tensors (biases, norms)
-
-            # Only quantize large weight matrices
+                return False
             if tensor.size < 256:
-                return None
-
-            original_shape = tensor.shape
-            # Reshape for group quantization
+                return False
+            # Check if dimensions are compatible with group_size
             if tensor.shape[-1] % group_size != 0:
-                return None  # Skip if not divisible
-
-            # Reshape to groups
-            num_groups = tensor.shape[-1] // group_size
-            grouped = tensor.reshape(-1, num_groups, group_size)
-
-            # Compute scales and zeros per group
-            mins = grouped.min(axis=-1, keepdims=True)
-            maxs = grouped.max(axis=-1, keepdims=True)
-
-            scales = (maxs - mins) / (2**bits - 1)
-            scales = mx.where(scales == 0, mx.ones_like(scales), scales)
-
-            # Quantize
-            quantized = mx.round((grouped - mins) / scales).astype(mx.uint8)
-
-            # Pack 4-bit values (2 per byte)
-            if bits == 4:
-                packed = quantized[..., ::2] | (quantized[..., 1::2] << 4)
-                packed = packed.reshape(original_shape[0], -1)
-            else:
-                packed = quantized.reshape(original_shape[0], -1)
-
-            # Reshape scales and biases
-            scales_out = scales.squeeze(-1).reshape(original_shape[0], -1)
-            biases_out = mins.squeeze(-1).reshape(original_shape[0], -1)
-
-            return packed, scales_out, biases_out
+                return False
+            return True
 
         final_weights = {}
         quantized_count = 0
         skipped_count = 0
 
         for key, tensor in converted_weights.items():
-            # Skip non-weight tensors and small tensors
-            if not key.endswith('.weight') or 'layernorm' in key.lower() or 'norm' in key.lower():
-                final_weights[key] = tensor
-                skipped_count += 1
-                continue
-
-            result = quantize_tensor(tensor, bits=bits, group_size=group_size)
-            if result is not None:
-                packed, scales, biases = result
+            if should_quantize(key, tensor):
+                # Use mx.quantize on individual tensor - produces uint32 packed format
+                packed, scales, biases = mx.quantize(tensor, group_size=group_size, bits=bits)
                 base_key = key[:-7]  # Remove '.weight'
                 final_weights[f"{base_key}.weight"] = packed
-                final_weights[f"{base_key}.scales"] = scales
-                final_weights[f"{base_key}.biases"] = biases
+                # Convert scales and biases to float16 for mlx-swift compatibility
+                final_weights[f"{base_key}.scales"] = scales.astype(mx.float16)
+                final_weights[f"{base_key}.biases"] = biases.astype(mx.float16)
                 quantized_count += 1
             else:
                 final_weights[key] = tensor
                 skipped_count += 1
 
-        print(f"  Quantized {quantized_count} layers, kept {skipped_count} in full precision")
+        print(f"  Quantized {quantized_count} layers (mx.quantize uint32 format)")
+        print(f"  Kept {skipped_count} layers in full precision")
         save_step = 5
     else:
         print(f"[PROGRESS] Step 4/{total_steps}: Keeping 16-bit weights (no quantization)...", flush=True)
@@ -734,6 +705,15 @@ def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_w
         save_step = 4
 
     print(f"[PROGRESS] Step {save_step}/{total_steps}: Saving model...", flush=True)
+
+    # Convert any bfloat16 to float16 for mlx-swift compatibility
+    bfloat_count = 0
+    for k, v in final_weights.items():
+        if v.dtype == mx.bfloat16:
+            final_weights[k] = v.astype(mx.float16)
+            bfloat_count += 1
+    if bfloat_count > 0:
+        print(f"  Converted {bfloat_count} tensors from bfloat16 to float16")
 
     output_model_file = os.path.join(output_dir, "model.safetensors")
     mx.save_safetensors(output_model_file, final_weights)
@@ -766,52 +746,103 @@ def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_w
     config_step = save_step + 1
     print(f"[PROGRESS] Step {config_step}/{total_steps}: Creating config and copying assets...", flush=True)
 
-    # Copy config.json from mlx-community model (has all required fields including vision_config)
-    config_file = os.path.join(output_dir, "config.json")
-    mlx_community_config = None
-
-    # Find mlx-community config.json
-    hf_cache = os.path.expanduser("~/.cache/huggingface/hub")
-    mlx_community_patterns = [
-        os.path.join(hf_cache, "models--mlx-community--FastVLM-0.5B-bf16", "snapshots", "*", "config.json"),
-    ]
+    # ================================================================
+    # Find MetaDone bundled model (preferred source for config files)
+    # ================================================================
     import glob as glob_module
-    for pattern in mlx_community_patterns:
+
+    metadone_bundled_paths = [
+        # Xcode DerivedData (development)
+        os.path.expanduser("~/Library/Developer/Xcode/DerivedData/MetaDone-*/Build/Products/Debug/MetaDone.app/Contents/Resources/Models/fastvlm-0.5b-captions"),
+        os.path.expanduser("~/Library/Developer/Xcode/DerivedData/MetaDone-*/Build/Products/Release/MetaDone.app/Contents/Resources/Models/fastvlm-0.5b-captions"),
+        # Installed app
+        "/Applications/MetaDone.app/Contents/Resources/Models/fastvlm-0.5b-captions",
+        os.path.expanduser("~/Applications/MetaDone.app/Contents/Resources/Models/fastvlm-0.5b-captions"),
+    ]
+
+    # Also check relative to script location (when running from MetaDone bundle)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    metadone_bundled_paths.extend([
+        os.path.join(script_dir, "..", "Models", "fastvlm-0.5b-captions"),
+        os.path.join(script_dir, "Models", "fastvlm-0.5b-captions"),
+        os.path.join(script_dir, "Resources", "Models", "fastvlm-0.5b-captions"),
+    ])
+
+    bundled_model_dir = None
+    for pattern in metadone_bundled_paths:
         matches = glob_module.glob(pattern)
-        if matches:
-            mlx_community_config = matches[0]
+        for match in matches:
+            if os.path.exists(os.path.join(match, "config.json")):
+                bundled_model_dir = match
+                print(f"  Found MetaDone bundled model: {match}")
+                break
+        if bundled_model_dir:
             break
 
-    if mlx_community_config and os.path.exists(mlx_community_config):
-        # Copy and optionally modify the config
-        with open(mlx_community_config, 'r') as f:
+    # ================================================================
+    # Copy ALL config files from bundled model (best compatibility)
+    # ================================================================
+    config_file = os.path.join(output_dir, "config.json")
+
+    if bundled_model_dir:
+        # Copy all config files from MetaDone bundled model
+        config_files_to_copy = [
+            "config.json", "tokenizer.json", "tokenizer_config.json",
+            "preprocessor_config.json", "processor_config.json",
+            "special_tokens_map.json", "generation_config.json"
+        ]
+        for cf in config_files_to_copy:
+            src = os.path.join(bundled_model_dir, cf)
+            dst = os.path.join(output_dir, cf)
+            if os.path.exists(src):
+                shutil.copy2(src, dst)
+        print(f"  Copied config files from MetaDone bundled model")
+
+        # Update config.json with quantization info if needed
+        with open(config_file, 'r') as f:
             config_data = json.load(f)
-
-        # Add quantization info if model was quantized
         if quantize:
-            config_data["quantization"] = {
-                "group_size": 64,
-                "bits": 4
-            }
+            config_data["quantization"] = {"group_size": 64, "bits": 4}
+            with open(config_file, 'w') as f:
+                json.dump(config_data, f, indent=4)
+            print(f"  Added quantization info to config.json")
 
-        with open(config_file, "w") as f:
-            json.dump(config_data, f, indent=4)
-        print(f"  Copied config.json from mlx-community {'(with 4-bit quantization)' if quantize else '(16-bit)'}")
+        # Copy fastvithd.mlpackage (vision encoder)
+        mlpackage_src = os.path.join(bundled_model_dir, "fastvithd.mlpackage")
+        mlpackage_dst = os.path.join(output_dir, "fastvithd.mlpackage")
+        if os.path.exists(mlpackage_src) and not os.path.exists(mlpackage_dst):
+            shutil.copytree(mlpackage_src, mlpackage_dst)
+            print(f"  Copied fastvithd.mlpackage")
     else:
-        # Fallback to minimal config if mlx-community not found
-        print("  WARNING: mlx-community config not found, creating minimal config")
+        # ================================================================
+        # Fallback: Create minimal correct config files
+        # ================================================================
+        print("  MetaDone bundled model not found, creating config files...")
+
+        # Create config.json with correct settings for mlx-swift
         metadone_config = {
             "architectures": ["LlavaQwen2ForCausalLM"],
             "attention_dropout": 0.0,
             "bos_token_id": 151643,
             "eos_token_id": 151645,
+            "freeze_mm_mlp_adapter": False,
             "hidden_act": "silu",
             "hidden_size": 896,
+            "image_aspect_ratio": "pad",
+            "image_grid_pinpoints": None,
             "image_token_index": 151646,
+            "initializer_range": 0.02,
             "intermediate_size": 4864,
             "max_position_embeddings": 32768,
+            "max_window_layers": 24,
             "mm_hidden_size": 3072,
+            "mm_patch_merge_type": "flat",
+            "mm_projector_lr": None,
             "mm_projector_type": "mlp2x_gelu",
+            "mm_use_im_patch_token": False,
+            "mm_use_im_start_end": False,
+            "mm_vision_select_feature": "patch",
+            "mm_vision_select_layer": -2,
             "mm_vision_tower": "mobileclip_l_1024",
             "model_type": "llava_qwen2",
             "num_attention_heads": 14,
@@ -819,8 +850,17 @@ def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_w
             "num_key_value_heads": 2,
             "rms_norm_eps": 1e-06,
             "rope_theta": 1000000.0,
-            "tie_word_embeddings": True,
+            "sliding_window": 32768,
+            "tie_word_embeddings": False,
+            "tokenizer_model_max_length": 8192,
+            "tokenizer_padding_side": "right",
+            "torch_dtype": "bfloat16",
+            "tune_mm_mlp_adapter": False,
+            "unfreeze_mm_vision_tower": True,
             "use_cache": True,
+            "use_mm_proj": True,
+            "use_sliding_window": False,
+            "vision_config": {},
             "vocab_size": 151936
         }
         if quantize:
@@ -828,113 +868,60 @@ def finalize_model_for_metadone(output_dir: str, base_model_name: str, adapter_w
         with open(config_file, "w") as f:
             json.dump(metadone_config, f, indent=4)
 
-    # Copy tokenizer files from base model
-    tokenizer_files = [
-        "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json",
-        "vocab.json", "merges.txt", "added_tokens.json", "generation_config.json",
-        "preprocessor_config.json", "processor_config.json"
-    ]
+        # Create processor_config.json (LlavaProcessor for mlx-swift)
+        processor_config = {
+            "image_token": "<image>",
+            "num_additional_image_tokens": 0,
+            "patch_size": 64,
+            "processor_class": "LlavaProcessor",
+            "vision_feature_select_strategy": None
+        }
+        with open(os.path.join(output_dir, "processor_config.json"), "w") as f:
+            json.dump(processor_config, f, indent=2)
 
-    copied_files = 0
-    if model_path:
-        for tf in tokenizer_files:
-            src = os.path.join(model_path, tf)
-            dst = os.path.join(output_dir, tf)
-            if os.path.exists(src) and not os.path.exists(dst):
-                shutil.copy2(src, dst)
-                copied_files += 1
+        # Create preprocessor_config.json
+        preprocessor_config = {
+            "crop_size": {"height": 1024, "width": 1024},
+            "do_center_crop": True,
+            "do_convert_rgb": True,
+            "do_normalize": True,
+            "do_rescale": True,
+            "do_resize": True,
+            "image_mean": [0.0, 0.0, 0.0],
+            "image_processor_type": "CLIPImageProcessor",
+            "image_std": [1.0, 1.0, 1.0],
+            "processor_class": "LlavaProcessor",
+            "resample": 3,
+            "rescale_factor": 0.00392156862745098,
+            "size": {"shortest_edge": 1024}
+        }
+        with open(os.path.join(output_dir, "preprocessor_config.json"), "w") as f:
+            json.dump(preprocessor_config, f, indent=2)
 
-    print(f"  Copied {copied_files} tokenizer/processor files")
+        # Copy tokenizer files from base model
+        if model_path:
+            tokenizer_files = [
+                "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json",
+                "vocab.json", "merges.txt", "added_tokens.json", "generation_config.json"
+            ]
+            for tf in tokenizer_files:
+                src = os.path.join(model_path, tf)
+                dst = os.path.join(output_dir, tf)
+                if os.path.exists(src) and not os.path.exists(dst):
+                    shutil.copy2(src, dst)
 
-    # Generate tokenizer.json if not present (required by mlx-swift-transformers)
-    tokenizer_json_path = os.path.join(output_dir, "tokenizer.json")
-    if not os.path.exists(tokenizer_json_path):
-        print("  Generating tokenizer.json from vocab.json + merges.txt...")
-        try:
-            from transformers import AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-            tokenizer.save_pretrained(output_dir)
-            if os.path.exists(tokenizer_json_path):
-                print("  Generated tokenizer.json successfully")
-            else:
-                print("  WARNING: Could not generate tokenizer.json - model may not load in MetaDone")
-        except Exception as e:
-            print(f"  WARNING: Failed to generate tokenizer.json: {e}")
+        # Generate tokenizer.json if not present
+        tokenizer_json_path = os.path.join(output_dir, "tokenizer.json")
+        if not os.path.exists(tokenizer_json_path) and model_path:
+            try:
+                from transformers import AutoTokenizer
+                tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                tokenizer.save_pretrained(output_dir)
+                print("  Generated tokenizer.json")
+            except Exception as e:
+                print(f"  WARNING: Failed to generate tokenizer.json: {e}")
 
-    # Re-copy tokenizer_config.json from base model to preserve chat_template
-    # (AutoTokenizer.save_pretrained may overwrite it without chat_template)
-    if model_path:
-        src_tokenizer_config = os.path.join(model_path, "tokenizer_config.json")
-        dst_tokenizer_config = os.path.join(output_dir, "tokenizer_config.json")
-        if os.path.exists(src_tokenizer_config):
-            shutil.copy2(src_tokenizer_config, dst_tokenizer_config)
-            print("  Restored tokenizer_config.json with chat_template from base model")
-
-    # Copy preprocessor/processor configs from bundled model or mlx-community cache
-    # These files are required by mlx_vlm but not present in HF base model
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    bundled_model_paths = [
-        os.path.join(script_dir, "..", "Models", "fastvlm-0.5b-captions"),
-        os.path.join(script_dir, "Models", "fastvlm-0.5b-captions"),
-    ]
-    for parent in ["Resources/Models/fastvlm-0.5b-captions", "../Resources/Models/fastvlm-0.5b-captions"]:
-        bundled_model_paths.append(os.path.join(script_dir, parent))
-
-    # Also check mlx-community model cache for processor files
-    hf_cache = os.path.expanduser("~/.cache/huggingface/hub")
-    mlx_community_patterns = [
-        os.path.join(hf_cache, "models--mlx-community--FastVLM-0.5B-bf16", "snapshots", "*"),
-    ]
-    import glob
-    for pattern in mlx_community_patterns:
-        matches = glob.glob(pattern)
-        bundled_model_paths.extend(matches)
-
-    bundled_model_dir = None
-    for candidate in bundled_model_paths:
-        if os.path.exists(os.path.join(candidate, "preprocessor_config.json")):
-            bundled_model_dir = candidate
-            break
-
-    if bundled_model_dir:
-        # Copy processor files required for mlx_vlm inference
-        extra_files = [
-            "preprocessor_config.json", "processor_config.json",
-            "tokenizer.json", "tokenizer_config.json",
-            "processing_fastvlm.py", "llava_qwen.py"
-        ]
-        for ef in extra_files:
-            src = os.path.join(bundled_model_dir, ef)
-            dst = os.path.join(output_dir, ef)
-            if os.path.exists(src):
-                # Always overwrite to ensure correct processor files
-                shutil.copy2(src, dst)
-                print(f"  Copied {ef} from {os.path.basename(bundled_model_dir)}")
-
-    # Copy fastvithd.mlpackage from bundle (if running from app)
-    # The script will look for it relative to its own location
-    mlpackage_src = os.path.join(script_dir, "..", "Models", "fastvlm-0.5b-captions", "fastvithd.mlpackage")
-
-    # Also try bundle Resources path
-    if not os.path.exists(mlpackage_src):
-        mlpackage_src = os.path.join(script_dir, "fastvithd.mlpackage")
-
-    # Try parent directories (for different bundle structures)
-    if not os.path.exists(mlpackage_src):
-        for parent in ["Resources/Models/fastvlm-0.5b-captions", "../Resources/Models/fastvlm-0.5b-captions"]:
-            candidate = os.path.join(script_dir, parent, "fastvithd.mlpackage")
-            if os.path.exists(candidate):
-                mlpackage_src = candidate
-                break
-
-    mlpackage_dst = os.path.join(output_dir, "fastvithd.mlpackage")
-
-    if os.path.exists(mlpackage_src) and not os.path.exists(mlpackage_dst):
-        shutil.copytree(mlpackage_src, mlpackage_dst)
-        print(f"  Copied fastvithd.mlpackage")
-    elif not os.path.exists(mlpackage_dst):
-        print(f"  WARNING: fastvithd.mlpackage not found - vision encoder may not work")
-        print(f"  Please manually copy it from MetaDone.app/Contents/Resources/Models/fastvlm-0.5b-captions/")
+        print("  WARNING: fastvithd.mlpackage not found - please copy manually from MetaDone.app")
 
     print("\nModel finalization complete!")
 
