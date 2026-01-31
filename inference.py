@@ -52,9 +52,13 @@ def main():
     image = load_image(str(image_path))
 
     # Format prompt with chat template
-    formatted_prompt = apply_chat_template(
-        processor, model.config, args.prompt, num_images=1
-    )
+    try:
+        formatted_prompt = apply_chat_template(
+            processor, model.config, args.prompt, num_images=1
+        )
+    except ValueError:
+        # Fallback: format prompt manually for FastVLM/Qwen2 (ChatML format)
+        formatted_prompt = f"<|im_start|>user\n<image>\n{args.prompt}<|im_end|>\n<|im_start|>assistant\n"
 
     # Generate
     print(f"\nPrompt: {args.prompt}")

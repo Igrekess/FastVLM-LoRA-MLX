@@ -875,9 +875,11 @@ def finalize_model(output_dir: str, base_model_name: str, adapter_weights: dict,
         if mlx_community_dir:
             # Copy config files from mlx-community model
             config_files_to_copy = [
-                "config.json", "tokenizer.json", "tokenizer_config.json",
+                "config.json", "tokenizer.json",
                 "preprocessor_config.json", "processor_config.json",
-                "special_tokens_map.json", "generation_config.json"
+                "special_tokens_map.json", "generation_config.json",
+                # Python files needed for AutoProcessor
+                "processing_fastvlm.py", "llava_qwen.py"
             ]
             for cf in config_files_to_copy:
                 src = os.path.join(mlx_community_dir, cf)
@@ -885,6 +887,14 @@ def finalize_model(output_dir: str, base_model_name: str, adapter_weights: dict,
                 if os.path.exists(src):
                     shutil.copy2(src, dst)
             print(f"  Copied config files from mlx-community model")
+
+            # Copy tokenizer_config.json from base model (has chat_template)
+            if model_path:
+                src = os.path.join(model_path, "tokenizer_config.json")
+                dst = os.path.join(output_dir, "tokenizer_config.json")
+                if os.path.exists(src):
+                    shutil.copy2(src, dst)
+                    print(f"  Copied tokenizer_config.json from base model (with chat_template)")
 
             # Update config.json with quantization info if needed
             if quantize:
