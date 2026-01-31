@@ -738,14 +738,15 @@ def finalize_model(output_dir: str, base_model_name: str, adapter_weights: dict,
 
     print(f"[PROGRESS] Step {save_step}/{total_steps}: Saving model...", flush=True)
 
-    # Convert any bfloat16 to float16 for mlx-swift compatibility
-    bfloat_count = 0
+    # Convert all tensors to float16 for mlx-swift compatibility
+    # (bfloat16 and float32 from LoRA merge are not supported)
+    converted_count = 0
     for k, v in final_weights.items():
-        if v.dtype == mx.bfloat16:
+        if v.dtype == mx.bfloat16 or v.dtype == mx.float32:
             final_weights[k] = v.astype(mx.float16)
-            bfloat_count += 1
-    if bfloat_count > 0:
-        print(f"  Converted {bfloat_count} tensors from bfloat16 to float16")
+            converted_count += 1
+    if converted_count > 0:
+        print(f"  Converted {converted_count} tensors to float16")
 
     output_model_file = os.path.join(output_dir, "model.safetensors")
     mx.save_safetensors(output_model_file, final_weights)
@@ -829,7 +830,7 @@ def finalize_model(output_dir: str, base_model_name: str, adapter_weights: dict,
                     shutil.copy2(src, dst)
             print(f"  Copied config files from MetaDone bundled model")
 
-            # Update config.json with quantization info if needed
+            # Update config.json with quantization info
             with open(config_file, 'r') as f:
                 config_data = json.load(f)
             if quantize:
@@ -837,6 +838,12 @@ def finalize_model(output_dir: str, base_model_name: str, adapter_weights: dict,
                 with open(config_file, 'w') as f:
                     json.dump(config_data, f, indent=4)
                 print(f"  Added quantization info to config.json")
+            elif "quantization" in config_data:
+                # Remove quantization info if model is not quantized
+                del config_data["quantization"]
+                with open(config_file, 'w') as f:
+                    json.dump(config_data, f, indent=4)
+                print(f"  Removed quantization info from config.json (16-bit model)")
 
             # Copy fastvithd.mlpackage (vision encoder for mlx-swift)
             mlpackage_src = os.path.join(bundled_model_dir, "fastvithd.mlpackage")
